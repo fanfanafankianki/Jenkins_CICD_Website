@@ -1,0 +1,454 @@
+pipeline {
+	agent any
+	tools {
+	    maven "MAVEN3"
+	    jdk "OracleJDK8"
+	}
+	
+    environment {
+        registryCredential = 'ecr:eu-west-1:awscredentials'
+        appRegistry = "320442627588.dkr.ecr.eu-west-1.amazonaws.com/jenkins_repo"
+        siteprojectRegistry = "https://320442627588.dkr.ecr.eu-west-1.amazonaws.com"
+    }
+
+	stages {
+	    stage('Fetch code') {
+            steps {
+				git branch: 'jenkins_branch', url: 'https://github.com/fanfanafankianki/gym_progress_site'
+            }
+	    }
+	
+		stage('Fetch test code') {
+			steps {
+				sh "mkdir -p test_code"
+				dir("test_code") {
+					git branch: 'main', url: 'https://github.com/fanfanafankianki/Tests_Gym_Progress_Site'
+				}
+			}   
+		}
+
+		stage('Archiving') {
+			steps {
+				sh 'ls'
+				sh 'pwd'
+			}
+			post {
+				success {
+					echo "Now archiving..."
+					archiveArtifacts artifacts: '*/**', excludes: 'README.md'
+				}
+			}
+		}
+		
+        stage('SonarQube analysis 1') {
+        	environment {
+        		scannerHome = tool 'SonarQube4.7'
+        	}
+        	steps {
+                withSonarQubeEnv('sonar') {
+					sh '''${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=PwrTrckrSite \
+					-Dsonar.projectName=PwrTrckr \
+					-Dsonar.projectVersion=1.0 \
+					-Dsonar.sources=. \
+					-Dsonar.java.binaries=target/test-classes/com/visualpathit/account/controllerTest/ \
+					-Dsonar.junit.reportsPath=target/surefire-reports/ \
+					-Dsonar.jacoco.reportsPath=target/jacoco.exec \
+					-Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml'''
+              	}
+        	}
+        }
+        stage('Quality gate') {
+        	steps {
+        		timeout(time: 3, unit: 'MINUTES') {
+        			waitForQualityGate abortPipeline: true
+        		}
+        	}
+        }
+		
+		stage('Build DB Image') {
+			steps {
+				script {
+					dockerImage = docker.build( appRegistry + ":$BUILD_NUMBER", "db/.")
+				}
+			}	
+		}
+
+		stage('Upload DB Image') {
+			steps{
+				script {
+					docker.withRegistry( siteprojectRegistry, registryCredential ) {
+					dockerImage.push('database')
+					}
+				}
+			}
+		}
+
+        stage('Deploy Test DB') {
+            steps {
+                script {
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: "awscredentials",
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]]) {
+
+
+                        def stackName = "myDBStack-${env.BUILD_NUMBER}"
+                        def templateFile = "ECS_Template_db.yaml"
+                        def region = "eu-west-1"
+                        sh "chmod 644 ${WORKSPACE}/ECS_Template.yaml"
+                        sh "aws cloudformation create-stack --stack-name ${stackName} --template-body file://${WORKSPACE}/ECS_Template_db.yaml --region ${region}"
+        
+                        def stackStatus = sh(script: "aws cloudformation describe-stacks --stack-name ${stackName} --query Stacks[0].StackStatus --output text --region ${region}", returnStdout: true).trim()
+                        def maxAttempts = 8
+                        def attempts = 0
+                        while (stackStatus != 'CREATE_COMPLETE' && attempts < maxAttempts) {
+                            echo "Stack status: ${stackStatus}"
+                            sleep 30
+                            stackStatus = sh(script: "aws cloudformation describe-stacks --stack-name ${stackName} --query Stacks[0].StackStatus --output text --region ${region}", returnStdout: true).trim()
+                            attempts++
+                        }
+                        if (stackStatus == 'CREATE_COMPLETE') {
+                            echo "Stack created successfully."
+                        } else {
+                            echo "Stack creation timeout: 250 seconds reached. Current status: ${stackStatus}"
+                            error("Stack creation failed: timeout reached.")
+                        }
+                    }
+                }
+            }
+	    }
+		
+        stage('Get DB Service IP') {
+            steps {
+                script {
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: "awscredentials",
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]]) {
+					
+						def serviceName = "MariaDBService"
+                        def region = "eu-west-1"
+						def taskId = sh(script: "aws ecs list-tasks --cluster production --service-name ${serviceName} --query taskArns[0] --output text --region ${region}", returnStdout: true).trim()
+						def containerInstanceId = sh(script: "aws ecs describe-tasks --cluster production --tasks ${taskId} --query tasks[0].containerInstanceArn --output text --region ${region}", returnStdout: true).trim()
+						def ec2InstanceId = sh(script: "aws ecs describe-container-instances --cluster production --container-instances ${containerInstanceId} --query containerInstances[0].ec2InstanceId --output text --region ${region}", returnStdout: true).trim()
+						def serviceIP = sh(script: "aws ec2 describe-instances --instance-ids ${ec2InstanceId} --query Reservations[0].Instances[0].PrivateIpAddress --output text --region ${region}", returnStdout: true).trim()
+
+						echo "DBService IP: ${serviceIP}"
+						env.DBSERVICE_IP = serviceIP
+					}
+                }
+            }
+        }
+		
+        stage('Modify db.php - change db ip private adress.') {
+            steps {
+                script {
+                    def phpFile = "${WORKSPACE}/php_functions/db.php"
+                    def newServername = "servername = \"${env.DBSERVICE_IP}:3306\";"
+                    def fileContent = readFile file: phpFile
+                    def updatedContent = fileContent.replaceAll(/servername\s*=\s*".*?";/, newServername)
+                    writeFile file: phpFile, text: updatedContent
+                    echo "registration.php updated successfully."
+                }
+            }
+        }
+		
+		stage('Build App Image') {
+			steps {
+				script {
+					dockerImage = docker.build( appRegistry + ":$BUILD_NUMBER", ".")
+				}
+			}	
+		}
+
+		stage('Upload App Image') {
+			steps{
+				script {
+					docker.withRegistry( siteprojectRegistry, registryCredential ) {
+					dockerImage.push('webapp')
+					}
+				}
+			}
+		}
+		
+        stage('Deploy Test App') {
+            steps {
+                script {
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: "awscredentials",
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]]) {
+
+                        def stackName = "myWebStack-${env.BUILD_NUMBER}"
+                        def templateFile = "ECS_Template_web.yaml"
+                        def region = "eu-west-1"
+                        sh "chmod 644 ${WORKSPACE}/ECS_Template.yaml"
+                        sh "aws cloudformation create-stack --stack-name ${stackName} --template-body file://${WORKSPACE}/ECS_Template_web.yaml --region ${region}"
+        
+                        def stackStatus = sh(script: "aws cloudformation describe-stacks --stack-name ${stackName} --query Stacks[0].StackStatus --output text --region ${region}", returnStdout: true).trim()
+                        def maxAttempts = 8
+                        def attempts = 0
+                        while (stackStatus != 'CREATE_COMPLETE' && attempts < maxAttempts) {
+                            echo "Stack status: ${stackStatus}"
+                            sleep 30
+                            stackStatus = sh(script: "aws cloudformation describe-stacks --stack-name ${stackName} --query Stacks[0].StackStatus --output text --region ${region}", returnStdout: true).trim()
+                            attempts++
+                        }
+                        if (stackStatus == 'CREATE_COMPLETE') {
+                            echo "Stack created successfully."
+                        } else {
+                            echo "Stack creation timeout: 250 seconds reached. Current status: ${stackStatus}"
+                            error("Stack creation failed: timeout reached.")
+                        }
+						
+						def serviceName = "UbuntuService"
+						def taskId = sh(script: "aws ecs list-tasks --cluster production --service-name ${serviceName} --query taskArns[0] --output text --region ${region}", returnStdout: true).trim()
+						def containerInstanceId = sh(script: "aws ecs describe-tasks --cluster production --tasks ${taskId} --query tasks[0].containerInstanceArn --output text --region ${region}", returnStdout: true).trim()
+						def ec2InstanceId = sh(script: "aws ecs describe-container-instances --cluster production --container-instances ${containerInstanceId} --query containerInstances[0].ec2InstanceId --output text --region ${region}", returnStdout: true).trim()
+						def serviceIP = sh(script: "aws ec2 describe-instances --instance-ids ${ec2InstanceId} --query Reservations[0].Instances[0].PrivateIpAddress --output text --region ${region}", returnStdout: true).trim()
+
+						echo "WebService IP: ${serviceIP}"
+						env.WEBSERVICE_IP = serviceIP
+
+                    }
+                }
+            }
+	    }	
+		
+        stage('Update links to site for tests') {
+            steps {
+                script {
+                    def webServiceIp = env.WEBSERVICE_IP
+        
+                    def filePath1 = "${env.WORKSPACE}/test_code/my-app/src/test/java/StepDefinitions/CalculatorSteps.java"
+                    def filePath2 = "${env.WORKSPACE}/test_code/my-app/src/test/java/StepDefinitions/LoginSteps.java"
+        
+                    def newServername1 = "driver.navigate().to(\"http://${env.WEBSERVICE_IP}/welcome.php\");"
+                    def newServername2 = "driver.navigate().to(\"http://${env.WEBSERVICE_IP}/welcome.php\");"
+        
+                    def fileContent1 = readFile file: filePath1
+                    def fileContent2 = readFile file: filePath2
+                    
+                    def pattern = /driver\.navigate\(\)\.to\("http:\/\/.*?\/(logged|welcome)\.php"\);/
+        
+                    def newContent1 = fileContent1.replaceAll(pattern, newServername1)
+                    def newContent2 = fileContent2.replaceAll(pattern, newServername2)
+        
+                    writeFile file: filePath1, text: newContent1
+                    writeFile file: filePath2, text: newContent2
+        
+                    echo "Updated logged and welcome link in tests"
+                }
+            }
+        }
+		
+		stage('Build Test Image') {
+			steps {
+				script {
+					dockerImage = docker.build( appRegistry + ":$BUILD_NUMBER", "${WORKSPACE}/test_code/")
+				}
+			}	
+		}
+
+		stage('Upload Test Image') {
+			steps{
+				script {
+					docker.withRegistry( siteprojectRegistry, registryCredential ) {
+						dockerImage.push('selenium')
+					}
+				}
+			}
+		}
+		
+		
+        stage('Deploy Test Selenium') {
+            steps {
+                script {
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: "awscredentials",
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]]) {
+
+                        def stackName = "mySeleniumStack-${env.BUILD_NUMBER}"
+                        def templateFile = "ECS_Template_selenium.yaml"
+                        def region = "eu-west-1"
+                        sh "chmod 644 ${WORKSPACE}/ECS_Template.yaml"
+                        sh "aws cloudformation create-stack --stack-name ${stackName} --template-body file://${WORKSPACE}/ECS_Template_selenium.yaml --region ${region}"
+        
+                        def stackStatus = sh(script: "aws cloudformation describe-stacks --stack-name ${stackName} --query Stacks[0].StackStatus --output text --region ${region}", returnStdout: true).trim()
+                        def maxAttempts = 8
+                        def attempts = 0
+                        while (stackStatus != 'CREATE_COMPLETE' && attempts < maxAttempts) {
+                            echo "Stack status: ${stackStatus}"
+                            sleep 30
+                            stackStatus = sh(script: "aws cloudformation describe-stacks --stack-name ${stackName} --query Stacks[0].StackStatus --output text --region ${region}", returnStdout: true).trim()
+                            attempts++
+                        }
+                        if (stackStatus == 'CREATE_COMPLETE') {
+                            echo "Stack created successfully."
+                            env.MY_TASK_ARN = sh(script: "aws ecs list-tasks --cluster production --family SeleniumChromeContainer --desired-status RUNNING --region ${region} --query 'taskArns[0]' --output text", returnStdout: true).trim()
+                        } else {
+                            echo "Stack creation timeout: 250 seconds reached. Current status: ${stackStatus}"
+                            error("Stack creation failed: timeout reached.")
+                        }
+
+                    }
+                }
+            }
+	    }
+        stage('Check Test Results') {
+            steps {
+                script {
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: "awscredentials",
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]]) {
+        
+                        def region = "eu-west-1"
+                        def taskArn = env.MY_TASK_ARN
+                        def taskStatus = sh(script: "aws ecs describe-tasks --cluster production --tasks ${taskArn} --region ${region} --query 'tasks[0].lastStatus' --output text", returnStdout: true).trim()
+                        def maxWaitAttempts = 20
+                        def waitAttempts = 0
+        
+                        while (taskStatus != 'STOPPED' && waitAttempts < maxWaitAttempts) {
+                            echo "Waiting for the container to stop. Current status: ${taskStatus}"
+                            sleep 30
+                            taskStatus = sh(script: "aws ecs describe-tasks --cluster production --tasks ${taskArn} --region ${region} --query 'tasks[0].lastStatus' --output text", returnStdout: true).trim()
+                            waitAttempts++
+                        }
+            
+                        if (taskStatus == 'STOPPED') {
+                            echo "Container stopped."
+                            def exitCode = sh(script: "aws ecs describe-tasks --cluster production --tasks ${taskArn} --region ${region} --query 'tasks[0].containers[0].exitCode' --output text", returnStdout: true).trim()
+            
+                            if (exitCode != '0') {
+                                echo "Tests failed. Exit code: ${exitCode}"
+                                error("Pipeline stopped due to failed tests.")
+                            } else {
+                                echo "All tests passed."
+                            }
+                        } else {
+                            echo "Container did not stop within the expected time."
+                            error("Pipeline stopped due to container not stopping within the expected time.")
+                        }
+                    }
+                }
+            }
+        }
+        stage('Destroy Test Selenium Stack') {
+            steps {
+                script {
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: "awscredentials",
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]]) {
+                        def stackName = "mySeleniumStack-${env.BUILD_NUMBER}"
+                        def region = "eu-west-1"
+                        sh "aws cloudformation delete-stack --stack-name ${stackName} --region ${region}"
+                        waitForStackDeletion(stackName, region)
+                    }
+                }
+            }
+        }
+        
+        stage('Destroy Test App Stack') {
+            steps {
+                script {
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: "awscredentials",
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]]) {
+                        def stackName = "myWebStack-${env.BUILD_NUMBER}"
+                        def region = "eu-west-1"
+                        sh "aws cloudformation delete-stack --stack-name ${stackName} --region ${region}"
+                        waitForStackDeletion(stackName, region)
+                    }
+                }
+            }
+        }
+        
+        stage('Destroy Test DB Stack') {
+            steps {
+                script {
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: "awscredentials",
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]]) {
+                        def stackName = "myDBStack-${env.BUILD_NUMBER}"
+                        def region = "eu-west-1"
+                        sh "aws cloudformation delete-stack --stack-name ${stackName} --region ${region}"
+                        waitForStackDeletion(stackName, region)
+                    }
+                }
+            }
+        }
+        stage('Modify db.php - change db ip private adress for deployment.') {
+            steps {
+                script {
+                    def phpFile = "${WORKSPACE}/php_functions/db.php"
+                    def newServername = "servername = \"database.powertrckr.com:3306\";"
+                    def fileContent = readFile file: phpFile
+                    def updatedContent = fileContent.replaceAll(/servername\s*=\s*".*?";/, newServername)
+                    writeFile file: phpFile, text: updatedContent
+                    echo "registration.php updated successfully."
+                }
+            }
+        }
+		stage('Build App Deployment Image') {
+			steps {
+				script {
+					dockerImage = docker.build( appRegistry + ":$BUILD_NUMBER", ".")
+				}
+			}	
+		}
+
+		stage('Upload App Deployment Image') {
+			steps{
+				script {
+					docker.withRegistry( siteprojectRegistry, registryCredential ) {
+					dockerImage.push('deploymentwebapp')
+					}
+				}
+			}
+		}
+	}
+}
+
+def waitForStackDeletion(stackName, region) {
+    def stackStatus = 'DELETE_IN_PROGRESS'
+    def maxAttempts = 10
+    def attempts = 0
+    while (stackStatus == 'DELETE_IN_PROGRESS' && attempts < maxAttempts) {
+        echo "Stack status: ${stackStatus}"
+        sleep 30
+        try {
+            stackStatus = sh(script: "aws cloudformation describe-stacks --stack-name ${stackName} --query Stacks[0].StackStatus --output text --region ${region}", returnStdout: true).trim()
+        } catch (Exception e) {
+            // This means the stack was successfully deleted
+            stackStatus = 'DELETE_COMPLETE'
+        }
+        attempts++
+    }
+    if (stackStatus == 'DELETE_COMPLETE') {
+        echo "Stack deleted successfully."
+    } else {
+        echo "Stack deletion timeout: 300 seconds reached. Current status: ${stackStatus}"
+        error("Stack deletion failed: timeout reached.")
+    }
+}
