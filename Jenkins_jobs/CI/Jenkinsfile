@@ -14,7 +14,7 @@ pipeline {
 	stages {
 	    stage('Fetch code') {
             steps {
-				git branch: 'jenkins_branch', url: 'https://github.com/fanfanafankianki/gym_progress_site'
+				git branch: 'master', url: 'https://github.com/fanfanafankianki/gym_progress_site'
             }
 	    }
 	
@@ -97,8 +97,8 @@ pipeline {
                         def stackName = "myDBStack-${env.BUILD_NUMBER}"
                         def templateFile = "ECS_Template_db.yaml"
                         def region = "eu-west-1"
-                        sh "chmod 644 ${WORKSPACE}/ECS_Template.yaml"
-                        sh "aws cloudformation create-stack --stack-name ${stackName} --template-body file://${WORKSPACE}/ECS_Template_db.yaml --region ${region}"
+                        sh "chmod 644 ${WORKSPACE}/ECS_templates/ECS_Template.yaml"
+                        sh "aws cloudformation create-stack --stack-name ${stackName} --template-body file://${WORKSPACE}/ECS_templates/ECS_Template_db.yaml --region ${region}"
         
                         def stackStatus = sh(script: "aws cloudformation describe-stacks --stack-name ${stackName} --query Stacks[0].StackStatus --output text --region ${region}", returnStdout: true).trim()
                         def maxAttempts = 8
@@ -188,8 +188,8 @@ pipeline {
                         def stackName = "myWebStack-${env.BUILD_NUMBER}"
                         def templateFile = "ECS_Template_web.yaml"
                         def region = "eu-west-1"
-                        sh "chmod 644 ${WORKSPACE}/ECS_Template.yaml"
-                        sh "aws cloudformation create-stack --stack-name ${stackName} --template-body file://${WORKSPACE}/ECS_Template_web.yaml --region ${region}"
+                        sh "chmod 644 ${WORKSPACE}/ECS_templates/ECS_Template.yaml"
+                        sh "aws cloudformation create-stack --stack-name ${stackName} --template-body file://${WORKSPACE}/ECS_templates/ECS_Template_web.yaml --region ${region}"
         
                         def stackStatus = sh(script: "aws cloudformation describe-stacks --stack-name ${stackName} --query Stacks[0].StackStatus --output text --region ${region}", returnStdout: true).trim()
                         def maxAttempts = 8
@@ -280,8 +280,8 @@ pipeline {
                         def stackName = "mySeleniumStack-${env.BUILD_NUMBER}"
                         def templateFile = "ECS_Template_selenium.yaml"
                         def region = "eu-west-1"
-                        sh "chmod 644 ${WORKSPACE}/ECS_Template.yaml"
-                        sh "aws cloudformation create-stack --stack-name ${stackName} --template-body file://${WORKSPACE}/ECS_Template_selenium.yaml --region ${region}"
+                        sh "chmod 644 ${WORKSPACE}/ECS_templates/ECS_Template.yaml"
+                        sh "aws cloudformation create-stack --stack-name ${stackName} --template-body file://${WORKSPACE}/ECS_templates/ECS_Template_selenium.yaml --region ${region}"
         
                         def stackStatus = sh(script: "aws cloudformation describe-stacks --stack-name ${stackName} --query Stacks[0].StackStatus --output text --region ${region}", returnStdout: true).trim()
                         def maxAttempts = 8
