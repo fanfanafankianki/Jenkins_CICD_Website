@@ -1,0 +1,52 @@
+pipeline {
+	agent any
+	tools {
+	    maven "MAVEN3"
+	    jdk "OracleJDK8"
+	}
+	
+    environment {
+        registryCredential = 'ecr:eu-west-1:awscredentials'
+        appRegistry = "320442627588.dkr.ecr.eu-west-1.amazonaws.com/jenkins_repo"
+        siteprojectRegistry = "https://320442627588.dkr.ecr.eu-west-1.amazonaws.com"
+    }
+	stages {
+	    stage('Create kubeconfig') {
+            steps {
+                withCredentials([
+                    aws(credentialsId: 'awscredentials', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    script {
+                        sh "aws eks update-kubeconfig --name production-pwrtrckr"
+                    }
+                
+                }
+            }
+        } 
+	    stage('Update deployment') {
+            steps {
+                withCredentials([
+                    aws(credentialsId: 'awscredentials', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    script {
+                        def newImage = "320442627588.dkr.ecr.eu-west-1.amazonaws.com/jenkins_repo:deploymentwebapp"
+                        echo "New Image: ${newImage}"                        
+                        sh "kubectl set image deployment/apache-deployment apache-container=${newImage} -n default"
+                
+                        sh 'sleep 40' // Poczekaj na zakończenie aktualizacji
+                        def currentImage = sh(returnStdout: true, script: 'kubectl get deployment apache-deployment -o jsonpath="{.spec.template.spec.containers[?(@.name==\\"apache-container\\")].image}"').trim()
+                        echo "Current Image: ${currentImage}"
+
+
+                        if (currentImage == newImage) {
+                            echo "true"
+                        } else {
+                            echo "false"
+                        }
+                    }
+                
+                }
+            }
+        }
+	}
+}
