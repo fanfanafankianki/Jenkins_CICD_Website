@@ -1,4 +1,4 @@
-# Jenkins CI/CD Jobs - Pielines for Continues Integration and Delivery for Powertrckr site
+# Jenkins CI/CD Jobs - Pipelines for Continuous Integration and Delivery for Powertrckr site
 <a name="readme-top"></a>
 <!-- ABOUT THE PROJECT -->
 ## About The Project
